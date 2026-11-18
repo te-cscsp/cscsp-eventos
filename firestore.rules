@@ -1,0 +1,92 @@
+rules_version = '2';
+
+// Regras de segurança – Teatro CSCSP (uso interno)
+// Papéis: administrator, operator, production (ver docs/roadmap.md, seção 5).
+// Acesso só para quem tem o documento users/{uid} com ativo == true.
+// Se o documento não existir, get() falha e a regra nega o acesso.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function logado() {
+      return request.auth != null;
+    }
+    function perfil() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function ativo() {
+      return logado() && perfil().ativo == true;
+    }
+    function admin() {
+      return ativo() && perfil().papel == 'administrator';
+    }
+    function operador() {
+      return ativo() && perfil().papel == 'operator';
+    }
+    function equipe() {
+      return admin() || operador();
+    }
+    function classeReservavel(c) {
+      return c in ['normal', 'preferencial', 'pcd'];
+    }
+
+    // Perfis de usuário: cada um lê o próprio; o administrador gerencia todos.
+    match /users/{uid} {
+      allow read: if logado() && (request.auth.uid == uid || admin());
+      allow write: if admin();
+    }
+
+    // Eventos e assentos por evento (somente documentos que fogem do padrão do layout)
+    match /events/{eventId} {
+      allow read: if ativo();
+      allow create, update, delete: if admin();
+
+      match /media/{docId} {
+        allow read: if ativo();
+        allow write: if admin();
+      }
+
+      match /seats/{seatId} {
+        allow read: if ativo();
+        allow create: if admin()
+          || (operador()
+              && request.resource.data.ocupado == true
+              && classeReservavel(request.resource.data.classe));
+        allow update: if admin()
+          || (operador()
+              && classeReservavel(resource.data.classe)
+              && request.resource.data.classe == resource.data.classe
+              && request.resource.data.diff(resource.data).affectedKeys()
+                   .hasOnly(['ocupado', 'reservaId', 'atualizadoPor', 'atualizadoEm']));
+        allow delete: if admin();
+      }
+    }
+
+    // Reservas contêm dados pessoais: só administrador e operador.
+    match /reservations/{reservaId} {
+      allow read: if equipe();
+      allow create: if equipe()
+        && request.resource.data.status == 'confirmed'
+        && request.resource.data.origem == 'interno'
+        && request.resource.data.criadoPor == request.auth.uid
+        && request.resource.data.seatIds is list
+        && request.resource.data.seatIds.size() > 0
+        && request.resource.data.seatIds.size() <= 20
+        && request.resource.data.nome is string
+        && request.resource.data.nome.size() > 1
+        && request.resource.data.ra is string;
+      allow update: if equipe()
+        && request.resource.data.status in ['confirmed', 'cancelled', 'checked_in']
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'nome', 'ra', 'tipoUsuario', 'telefone', 'email',
+                       'observacao', 'historico', 'atualizadoEm', 'checkedInEm']);
+      allow delete: if false;
+    }
+
+    // Auditoria: qualquer usuário ativo grava; só o administrador lê; ninguém edita.
+    match /auditLog/{logId} {
+      allow create: if ativo() && request.resource.data.uid == request.auth.uid;
+      allow read: if admin();
+      allow update, delete: if false;
+    }
+  }
+}
